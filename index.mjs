@@ -730,62 +730,109 @@ function isRecoverableGatewayError(errorMessage) {
   if (!normalized) return false;
   return /(terminated|abort|cancel|killed|interrupt|retry|timeout|in[_ -]?flight)/i.test(normalized);
 }
-async function sendReply(ctx, messageType, groupId, userId, text) {
-  const action = messageType === "group" ? "send_group_msg" : "send_private_msg";
-  const idKey = messageType === "group" ? "group_id" : "user_id";
-  const idVal = String(messageType === "group" ? groupId : userId);
+async function sendReply(ctx, messageType, groupId, userId, text, maxRetries = 3) {
   const maxLen = 3e3;
   if (text.length <= maxLen) {
-    await ctx.actions.call(action, { [idKey]: idVal, message: text }, ctx.adapterName, ctx.pluginManager?.config);
+    if (messageType === "group") {
+      await sendGroupMsg(ctx, groupId, text, maxRetries);
+    } else {
+      await sendPrivateMsg(ctx, userId, text, maxRetries);
+    }
   } else {
     const total = Math.ceil(text.length / maxLen);
     for (let i = 0; i < text.length; i += maxLen) {
       const idx = Math.floor(i / maxLen) + 1;
       const prefix = total > 1 ? `[${idx}/${total}]
 ` : "";
-      await ctx.actions.call(
-        action,
-        { [idKey]: idVal, message: prefix + text.slice(i, i + maxLen) },
-        ctx.adapterName,
-        ctx.pluginManager?.config
-      );
+      const chunk = prefix + text.slice(i, i + maxLen);
+      if (messageType === "group") {
+        await sendGroupMsg(ctx, groupId, chunk, maxRetries);
+      } else {
+        await sendPrivateMsg(ctx, userId, chunk, maxRetries);
+      }
       if (i + maxLen < text.length) await sleep(1e3);
     }
   }
 }
-async function sendImageMsg(ctx, messageType, groupId, userId, imageUrl) {
+async function sendImageMsg(ctx, messageType, groupId, userId, imageUrl, maxRetries = 3) {
   const message = [{ type: "image", data: { url: imageUrl } }];
-  if (messageType === "group") {
-    await ctx.actions.call(
-      "send_group_msg",
-      { group_id: String(groupId), message },
-      ctx.adapterName,
-      ctx.pluginManager?.config
-    );
-    return;
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      if (messageType === "group") {
+        await ctx.actions.call(
+          "send_group_msg",
+          { group_id: String(groupId), message },
+          ctx.adapterName,
+          ctx.pluginManager?.config
+        );
+      } else {
+        await ctx.actions.call(
+          "send_private_msg",
+          { user_id: String(userId), message },
+          ctx.adapterName,
+          ctx.pluginManager?.config
+        );
+      }
+      logger?.debug(`[OpenClaw] 发送图片成功 (尝试 ${attempt}/${maxRetries})`);
+      return;
+    } catch (e) {
+      lastError = e;
+      logger?.warn(`[OpenClaw] 发送图片失败 (尝试 ${attempt}/${maxRetries}): ${e.message}`);
+      if (attempt < maxRetries) {
+        await sleep(500 * attempt);
+      }
+    }
   }
-  await ctx.actions.call(
-    "send_private_msg",
-    { user_id: String(userId), message },
-    ctx.adapterName,
-    ctx.pluginManager?.config
-  );
+  logger?.error(`[OpenClaw] 发送图片最终失败：${lastError?.message}`);
+  throw lastError;
 }
-async function sendGroupMsg(ctx, groupId, text) {
-  await ctx.actions.call(
-    "send_group_msg",
-    { group_id: String(groupId), message: text },
-    ctx.adapterName,
-    ctx.pluginManager?.config
-  );
+async function sendGroupMsg(ctx, groupId, text, maxRetries = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await ctx.actions.call(
+        "send_group_msg",
+        { group_id: String(groupId), message: text },
+        ctx.adapterName,
+        ctx.pluginManager?.config
+      );
+      logger?.debug(`[OpenClaw] 发送群消息成功 (尝试 ${attempt}/${maxRetries})`);
+      return;
+    } catch (e) {
+      lastError = e;
+      logger?.warn(`[OpenClaw] 发送群消息失败 (尝试 ${attempt}/${maxRetries}): ${e.message}`);
+      if (attempt < maxRetries) {
+        await sleep(500 * attempt);
+      }
+    }
+  }
+  logger?.error(`[OpenClaw] 发送群消息最终失败：${lastError?.message}`);
+  throw lastError;
 }
-async function sendPrivateMsg(ctx, userId, text) {
-  await ctx.actions.call(
-    "send_private_msg",
-    { user_id: String(userId), message: text },
-    ctx.adapterName,
-    ctx.pluginManager?.config
-  );
+async function sendPrivateMsg(ctx, userId, text, maxRetries = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await ctx.actions.call(
+        "send_private_msg",
+        { user_id: String(userId), message: text },
+        ctx.adapterName,
+        ctx.pluginManager?.config
+      );
+      logger?.debug(`[OpenClaw] 发送私聊消息成功 (尝试 ${attempt}/${maxRetries})`);
+      return; // 成功则返回
+    } catch (e) {
+      lastError = e;
+      logger?.warn(`[OpenClaw] 发送私聊消息失败 (尝试 ${attempt}/${maxRetries}): ${e.message}`);
+      if (attempt < maxRetries) {
+        await sleep(500 * attempt); // 递增延迟重试
+      }
+    }
+  }
+  logger?.error(`[OpenClaw] 发送私聊消息最终失败：${lastError?.message}`);
+  throw lastError;
 }
 function isPrivateIp(host) {
   if (!host) return true;
