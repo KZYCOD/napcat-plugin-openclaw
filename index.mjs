@@ -1198,9 +1198,12 @@ ${mediaInfo}` : mediaInfo;
           clearTimeout(timeout);
           gwClient.chatWaiters.delete(waitRunId);
         };
-        // 节流控制：记录上次发送 delta 的时间
+        // 累积 delta 文本，避免发送碎片
+        let accumulatedDelta = "";
         let lastDeltaSentAt = 0;
-        const DELTA_THROTTLE_MS = 3000; // 每 3 秒最多发送一条 delta
+        let lastSentLength = 0;
+        const DELTA_THROTTLE_MS = 3000; // 每 3 秒最多发送一条
+        const DELTA_MIN_LENGTH = 30;    // 最小发送长度
         
         gwClient.chatWaiters.set(waitRunId, { handler: (payload) => {
           if (settled) return;
@@ -1210,17 +1213,23 @@ ${mediaInfo}` : mediaInfo;
           }
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
           
-          // 实时推送 delta 事件（思考过程）- 带节流
+          // 实时推送 delta 事件（思考过程）- 累积模式
           if (payload.state === "delta" && payload.message && currentConfig.features?.realtimePush) {
-            const deltaText = extractContentText(payload.message).trim();
+            const newText = extractContentText(payload.message) || "";
+            accumulatedDelta += newText;
+            
             const now = Date.now();
-            // 只在满足以下条件时发送：
+            const newLength = accumulatedDelta.length;
+            const deltaSinceLastSend = newLength - lastSentLength;
+            
+            // 发送条件：
             // 1. 距离上次发送超过 3 秒
-            // 2. 文本长度超过 20 字（避免发送太碎的片段）
-            if (deltaText && deltaText.length >= 20 && (now - lastDeltaSentAt) >= DELTA_THROTTLE_MS) {
-              logger.debug(`[OpenClaw] 实时推送 delta: ${deltaText.slice(0, 50)}`);
-              void sendReply(ctx, messageType, groupId, userId, `🤔 ${deltaText}`);
+            // 2. 新增内容超过 30 字（避免重复发送相同内容）
+            if (deltaSinceLastSend >= DELTA_MIN_LENGTH && (now - lastDeltaSentAt) >= DELTA_THROTTLE_MS) {
+              logger.debug(`[OpenClaw] 实时推送 delta: ${accumulatedDelta.slice(0, 50)}`);
+              void sendReply(ctx, messageType, groupId, userId, `🤔 ${accumulatedDelta}`);
               lastDeltaSentAt = now;
+              lastSentLength = newLength;
             }
             return;
           }
