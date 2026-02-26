@@ -1205,6 +1205,20 @@ ${mediaInfo}` : mediaInfo;
             latestSessionKey = payload.sessionKey.trim();
           }
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
+          
+          // 实时推送 delta 事件（思考过程）
+          if (payload.state === "delta" && payload.message) {
+            const deltaText = extractContentText(payload.message).trim();
+            if (deltaText && deltaText.length > 0) {
+              logger.debug(`[OpenClaw] 实时推送 delta: ${deltaText.slice(0, 50)}`);
+              // 如果开启实时推送功能，发送思考内容
+              if (currentConfig.features?.realtimePush) {
+                void sendReply(ctx, messageType, groupId, userId, `🤔 ${deltaText}`);
+              }
+            }
+            return;
+          }
+          
           if (payload.state === "final") {
             const directText = extractContentText(payload.message).trim();
             // 检查是否有内容（文本或图片）
