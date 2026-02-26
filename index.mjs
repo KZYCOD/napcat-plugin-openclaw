@@ -1198,12 +1198,9 @@ ${mediaInfo}` : mediaInfo;
           clearTimeout(timeout);
           gwClient.chatWaiters.delete(waitRunId);
         };
-        // 累积 delta 文本，避免发送碎片
-        let accumulatedDelta = "";
-        let lastDeltaSentAt = 0;
-        let lastSentLength = 0;
-        const DELTA_THROTTLE_MS = 3000; // 每 3 秒最多发送一条
-        const DELTA_MIN_LENGTH = 30;    // 最小发送长度
+        // 可选：发送一条"正在思考"提示
+        let thinkingSent = false;
+        const THINKING_DELAY_MS = 5000; // 5 秒后发送思考提示
         
         gwClient.chatWaiters.set(waitRunId, { handler: (payload) => {
           if (settled) return;
@@ -1213,24 +1210,14 @@ ${mediaInfo}` : mediaInfo;
           }
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
           
-          // 实时推送 delta 事件（思考过程）- 累积模式
-          if (payload.state === "delta" && payload.message && currentConfig.features?.realtimePush) {
-            const newText = extractContentText(payload.message) || "";
-            accumulatedDelta += newText;
-            
-            const now = Date.now();
-            const newLength = accumulatedDelta.length;
-            const deltaSinceLastSend = newLength - lastSentLength;
-            
-            // 发送条件：
-            // 1. 距离上次发送超过 3 秒
-            // 2. 新增内容超过 30 字（避免重复发送相同内容）
-            if (deltaSinceLastSend >= DELTA_MIN_LENGTH && (now - lastDeltaSentAt) >= DELTA_THROTTLE_MS) {
-              logger.debug(`[OpenClaw] 实时推送 delta: ${accumulatedDelta.slice(0, 50)}`);
-              void sendReply(ctx, messageType, groupId, userId, `🤔 ${accumulatedDelta}`);
-              lastDeltaSentAt = now;
-              lastSentLength = newLength;
-            }
+          // 可选：如果超过 5 秒还没完成，发送一条思考提示（仅一次）
+          if (payload.state === "delta" && !thinkingSent && currentConfig.features?.showThinkingHint) {
+            thinkingSent = true;
+            setTimeout(() => {
+              if (!settled) {
+                void sendReply(ctx, messageType, groupId, userId, "🤔 正在思考中，请稍候...");
+              }
+            }, THINKING_DELAY_MS);
             return;
           }
           
