@@ -10,6 +10,19 @@ import path from 'path';
 import WebSocket from 'ws';
 import { fileURLToPath } from 'url';
 
+// ============ 常量定义 ============
+const TIMEOUTS = {
+  WAIT_FINAL: 180_000,        // 180 秒 - 等待 final 事件超时
+  HEARTBEAT: 15_000,          // 15 秒 - 心跳间隔
+  CACHE_EXPIRY: 3_600_000,    // 1 小时 - 缓存过期时间
+  DEBOUNCE_DEFAULT: 2_000,    // 2 秒 - 默认防抖间隔
+  REQUEST_TIMEOUT: 180_000,   // 180 秒 - 请求超时
+  RECOVER_MAX_ATTEMPTS: 40,   // 历史回查最大尝试次数
+  RECOVER_INTERVAL: 500,      // 500ms - 历史回查间隔
+  RECOVER_FINAL_ATTEMPTS: 20, // final 无文本时回查尝试次数
+  RECOVER_FINAL_INTERVAL: 400 // 400ms - final 无文本时回查间隔
+};
+
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 function ensureDir(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -74,7 +87,8 @@ function loadOrCreateDeviceIdentity(filePath) {
 `, { mode: 384 });
           try {
             fs.chmodSync(filePath, 384);
-          } catch {
+          } catch (e) {
+            // 忽略 chmod 失败，不影响功能
           }
           return {
             deviceId: derivedId,
@@ -89,7 +103,8 @@ function loadOrCreateDeviceIdentity(filePath) {
         };
       }
     }
-  } catch {
+  } catch (e) {
+    // 忽略读取失败，会创建新的身份文件
   }
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
@@ -915,14 +930,15 @@ async function saveMediaToCache(mediaList, ctx) {
     }
   }
   try {
-    const cutoff = Date.now() - 36e5;
+    const cutoff = Date.now() - TIMEOUTS.CACHE_EXPIRY;
     const files = await fs.promises.readdir(cacheDir);
     for (const name of files) {
       const fullPath = path.join(cacheDir, name);
       const stat = await fs.promises.stat(fullPath);
       if (stat.mtimeMs < cutoff) await fs.promises.unlink(fullPath);
     }
-  } catch {
+  } catch (e) {
+    logger?.debug(`[OpenClaw] 缓存清理跳过：${e.message}`);
   }
   return saved;
 }
@@ -1107,7 +1123,7 @@ ${mediaInfo}` : mediaInfo;
           cleanup();
           resolve(value);
         };
-        const recoverFromHistory = async (reason, fallback, maxAttempts = 40, intervalMs = 500) => {
+        const recoverFromHistory = async (reason, fallback, maxAttempts = TIMEOUTS.RECOVER_MAX_ATTEMPTS, intervalMs = TIMEOUTS.RECOVER_INTERVAL) => {
           if (settled || recovering) return;
           recovering = true;
           try {
@@ -1129,8 +1145,8 @@ ${mediaInfo}` : mediaInfo;
         };
         const timeout = setTimeout(() => {
           logger.warn("[OpenClaw] 等待 final 超时，尝试通过 chat.history 补拉回复");
-          void recoverFromHistory("等待 final 超时", null, 12, 500);
-        }, 18e4);
+          void recoverFromHistory("等待 final 超时", null, 12, TIMEOUTS.RECOVER_INTERVAL);
+        }, TIMEOUTS.WAIT_FINAL);
         const cleanup = () => {
           clearTimeout(timeout);
           gwClient.chatWaiters.delete(waitRunId);
@@ -1144,9 +1160,16 @@ ${mediaInfo}` : mediaInfo;
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
           if (payload.state === "final") {
             const directText = extractContentText(payload.message).trim();
-            // 直接 resolve，即使为空也没关系（后续 extractImagesFromReply 会处理图片）
-            // 不要调用 recoverFromHistory，避免重复发送
-            safeResolve(directText || "");
+            // 检查是否有内容（文本或图片）
+            const { images, localImages } = extractImagesFromReply(directText);
+            if (directText || images.length > 0 || localImages.length > 0) {
+              // 有有效内容，直接 resolve
+              safeResolve(directText);
+            } else {
+              // 真的没有内容，触发历史回查
+              logger.warn("[OpenClaw] final 帧无文本且无图片，尝试通过 chat.history 补拉回复");
+              void recoverFromHistory("final 帧无有效内容", null, TIMEOUTS.RECOVER_FINAL_ATTEMPTS, TIMEOUTS.RECOVER_FINAL_INTERVAL);
+            }
             return;
           }
           if (payload.state === "aborted") {
