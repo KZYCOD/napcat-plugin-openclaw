@@ -147,6 +147,8 @@ class GatewayClient {
   reconnectTimer = null;
   lastPong = 0;
   _destroyed = false;
+  _connectionId = 0; // 连接 ID，用于追踪断开/重连
+  _activeRunIds = /* @__PURE__ */ new Map(); // runId -> { sessionKey, startedAt, message } 用于重连恢复
   constructor(url, token, logger) {
     this.url = url;
     this.token = token;
@@ -203,10 +205,19 @@ class GatewayClient {
         this._connected = false;
         this.connectPromise = null;
         this.stopHeartbeat();
+        // 清理并拒绝所有 pending 请求
         for (const [, p] of this.pending) {
           p.reject(new Error(`ws closed: ${code}`));
         }
         this.pending.clear();
+        // 清理并拒绝所有 chatWaiters（关键修复）
+        for (const [runId, waiter] of this.chatWaiters) {
+          this.logger?.warn(`[OpenClaw] WS 断开，清理 chatWaiter: ${runId?.slice(0, 8)}`);
+          if (waiter.onDisconnect) {
+            waiter.onDisconnect(new Error(`ws closed: ${code}`));
+          }
+        }
+        this.chatWaiters.clear();
         this.scheduleReconnect();
       });
       this.ws.on("error", (err) => {
@@ -304,6 +315,7 @@ class GatewayClient {
         clearTimeout(timeout);
         this._connected = true;
         this.connectPromise = null;
+        this._connectionId++; // 连接成功，递增连接 ID
         this.logger?.info("[OpenClaw] Gateway 认证成功");
         this.startHeartbeat();
         resolve();
@@ -402,6 +414,8 @@ class GatewayClient {
     }
     this._connected = false;
     this.connectPromise = null;
+    // 清理活跃 runId 追踪
+    this._activeRunIds?.clear();
   }
 }
 
@@ -547,10 +561,22 @@ const LOCAL_COMMANDS = {
   "/whoami": cmdWhoami
 };
 const sessionEpochs = /* @__PURE__ */ new Map();
+// OpenClaw 标准 sessionKey 格式:
+// - 私聊: agent:<agentId>:<channel>:dm:<peerId>
+// - 群聊: agent:<agentId>:<channel>:group:<groupId>
+const AGENT_ID = "main";
+const CHANNEL_ID = "qq";
+
 function getSessionBase(messageType, userId, groupId) {
-  if (messageType === "private") return `qq-${userId}`;
-  if (currentConfig.behavior.groupSessionMode === "shared") return `qq-g${groupId}`;
-  return `qq-g${groupId}-${userId}`;
+  // 使用 OpenClaw 标准格式，让 Gateway 能正确推断 messageChannel
+  if (messageType === "private") {
+    return `agent:${AGENT_ID}:${CHANNEL_ID}:dm:${userId}`;
+  }
+  if (currentConfig.behavior.groupSessionMode === "shared") {
+    return `agent:${AGENT_ID}:${CHANNEL_ID}:group:${groupId}`;
+  }
+  // 群聊中每个用户独立会话: group:<groupId>:user:<userId>
+  return `agent:${AGENT_ID}:${CHANNEL_ID}:group:${groupId}:user:${userId}`;
 }
 function getSessionKey(sessionBase) {
   const epoch = sessionEpochs.get(sessionBase) || 0;
@@ -1015,20 +1041,25 @@ function extractImagesFromReply(text) {
 function setupAgentPushListener(gw) {
   gw.eventHandlers.set("chat", (payload) => {
     if (!payload || payload.state !== "final" || !payload.sessionKey) return;
-    if (!payload.sessionKey.startsWith("qq-")) return;
+    // 匹配新格式: agent:main:qq:dm:<userId> 或 agent:main:qq:group:<groupId>...
+    if (!payload.sessionKey.startsWith("agent:main:qq:")) return;
     if (payload.runId && gw.chatWaiters.has(payload.runId)) return;
     if (!lastCtx) return;
     const text = extractContentText(payload.message).trim();
     if (!text) return;
     logger?.info(`[OpenClaw] Agent 主动推送: ${payload.sessionKey} -> ${text.slice(0, 50)}`);
-    const privateMatch = payload.sessionKey.match(/^qq-(\d+)(?:-\d+)?$/);
-    if (privateMatch && !payload.sessionKey.includes("-g")) {
+    
+    // 私聊格式: agent:main:qq:dm:<userId>
+    const privateMatch = payload.sessionKey.match(/^agent:main:qq:dm:(\d+)$/);
+    if (privateMatch) {
       const { images, cleanText } = extractImagesFromReply(text);
       if (cleanText) void sendPrivateMsg(lastCtx, privateMatch[1], cleanText);
       for (const img of images) void sendImageMsg(lastCtx, "private", null, privateMatch[1], img);
       return;
     }
-    const groupMatch = payload.sessionKey.match(/^qq-g(\d+)/);
+    
+    // 群聊格式: agent:main:qq:group:<groupId> 或 agent:main:qq:group:<groupId>:user:<userId>
+    const groupMatch = payload.sessionKey.match(/^agent:main:qq:group:(\d+)/);
     if (groupMatch) {
       const { images, cleanText } = extractImagesFromReply(text);
       if (cleanText) void sendGroupMsg(lastCtx, groupMatch[1], cleanText);
@@ -1197,12 +1228,38 @@ ${mediaInfo}` : mediaInfo;
         const cleanup = () => {
           clearTimeout(timeout);
           gwClient.chatWaiters.delete(waitRunId);
+          // 清理活跃 runId 追踪
+          gwClient._activeRunIds?.delete(waitRunId);
         };
         // 可选：发送一条"正在思考"提示
         let thinkingSent = false;
         const THINKING_DELAY_MS = 5000; // 5 秒后发送思考提示
         
-        gwClient.chatWaiters.set(waitRunId, { handler: (payload) => {
+        // 连接断开时的回调处理
+        const onDisconnect = async (error) => {
+          if (settled) return;
+          logger.warn(`[OpenClaw] 等待回复期间连接断开: ${error?.message || error}，等待重连后恢复...`);
+          // 不立即失败，而是等待重连后尝试从历史恢复
+          // 给重连一点时间（最多 30 秒）
+          const maxWait = 30000;
+          const checkInterval = 1000;
+          let waited = 0;
+          while (!settled && waited < maxWait && !gwClient._connected) {
+            await sleep(checkInterval);
+            waited += checkInterval;
+          }
+          if (settled) return;
+          if (gwClient._connected) {
+            logger.info("[OpenClaw] 连接已恢复，尝试通过 chat.history 恢复回复");
+            await recoverFromHistory("连接恢复后历史回查", null, 20, 500);
+          } else {
+            safeResolve(null);
+          }
+        };
+        
+        // 注册 waiter，包含断开回调
+        gwClient.chatWaiters.set(waitRunId, {
+          handler: (payload) => {
           if (settled) return;
           if (!payload) return;
           if (typeof payload.sessionKey === "string" && payload.sessionKey.trim()) {
@@ -1260,7 +1317,18 @@ ${mediaInfo}` : mediaInfo;
             }
             return;
           }
-        } });
+        },
+          onDisconnect
+        });
+        
+        // 追踪活跃的 runId，用于重连恢复
+        if (gwClient._activeRunIds) {
+          gwClient._activeRunIds.set(waitRunId, {
+            sessionKey,
+            startedAt: runStartedAtMs,
+            message: openclawMessage?.slice(0, 100)
+          });
+        }
       });
       const sendResult = await gwClient.request("chat.send", {
         sessionKey,
@@ -1353,6 +1421,14 @@ const plugin_cleanup = async () => {
   }
   debounceBuffers.clear();
   if (gatewayClient) {
+    // 清理所有 chatWaiters
+    for (const [runId, waiter] of gatewayClient.chatWaiters) {
+      logger?.debug(`[OpenClaw] 清理 chatWaiter: ${runId?.slice(0, 8)}`);
+      if (waiter.onDisconnect) {
+        waiter.onDisconnect(new Error("plugin cleanup"));
+      }
+    }
+    gatewayClient.chatWaiters.clear();
     gatewayClient.disconnect();
     gatewayClient = null;
     pushListenerAttached = false;
